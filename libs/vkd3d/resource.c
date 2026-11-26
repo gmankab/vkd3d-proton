@@ -6565,6 +6565,37 @@ static void vkd3d_create_buffer_srv_heap(vkd3d_cpu_descriptor_va_t desc_va,
     memcpy(d.payload, stack_payload, bindless->cbv_srv_uav_size);
 }
 
+static void vkd3d_write_packed_buffer_ssbo(struct d3d12_device *device,
+        const struct vkd3d_descriptor_metadata_buffer_view *view, bool typed, void *payload)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    VkDescriptorAddressInfoEXT addr_info;
+    VkDescriptorGetInfoEXT get_info;
+    VkDeviceSize alignment;
+
+    alignment = device->device_info.properties2.properties.limits.minStorageBufferOffsetAlignment;
+    addr_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT;
+    addr_info.pNext = NULL;
+    addr_info.address = view->va;
+    addr_info.range = view->range;
+    addr_info.format = VK_FORMAT_UNDEFINED;
+
+    /* A typed view can be valid at a texel boundary that cannot be used by its SSBO alias.
+     * Keep the typed descriptor and clear the alias instead of writing an invalid SSBO. */
+    if (typed && (addr_info.address & (alignment - 1)))
+    {
+        addr_info.address = 0;
+        addr_info.range = VK_WHOLE_SIZE;
+    }
+
+    get_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT;
+    get_info.pNext = NULL;
+    get_info.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    get_info.data.pStorageBuffer = &addr_info;
+    VK_CALL(vkGetDescriptorEXT(device->vk_device, &get_info,
+            device->device_info.descriptor_buffer_properties.robustStorageBufferDescriptorSize, payload));
+}
+
 static void vkd3d_create_buffer_srv_embedded(vkd3d_cpu_descriptor_va_t desc_va,
         struct d3d12_device *device, struct d3d12_resource *resource,
         const D3D12_SHADER_RESOURCE_VIEW_DESC *desc)
@@ -6626,23 +6657,18 @@ static void vkd3d_create_buffer_srv_embedded(vkd3d_cpu_descriptor_va_t desc_va,
                 stride, &view);
     }
 
-    /* Emit SSBO. */
+    vkd3d_write_packed_buffer_ssbo(device, &view, desc->Format != DXGI_FORMAT_UNKNOWN && !is_byte_address,
+            d.payload + device->bindless_state.packed_raw_buffer_offset);
+
+    /* Emit texel buffer alias. */
     get_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT;
     get_info.pNext = NULL;
-    get_info.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    get_info.data.pStorageBuffer = &addr_info;
+    get_info.type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    get_info.data.pUniformTexelBuffer = &addr_info;
     addr_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT;
     addr_info.pNext = NULL;
     addr_info.address = view.va;
     addr_info.range = view.range;
-    addr_info.format = VK_FORMAT_UNDEFINED;
-    VK_CALL(vkGetDescriptorEXT(device->vk_device, &get_info,
-            device->device_info.descriptor_buffer_properties.robustStorageBufferDescriptorSize,
-            d.payload + device->bindless_state.packed_raw_buffer_offset));
-
-    /* Emit texel buffer alias. */
-    get_info.type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
-    get_info.data.pUniformTexelBuffer = &addr_info;
     addr_info.format = vkd3d_internal_get_vk_format(device, view.dxgi_format);
     /* If we really intended to emit raw buffers, the fallback will be inferred as R32_UINT. */
     if (addr_info.format == VK_FORMAT_UNDEFINED)
@@ -7716,26 +7742,22 @@ static void vkd3d_create_buffer_uav_embedded(vkd3d_cpu_descriptor_va_t desc_va, 
     if (m.view)
         m.view->info.buffer = view;
 
-    get_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT;
-    get_info.pNext = NULL;
-    get_info.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    get_info.data.pStorageBuffer = &addr_info;
-    addr_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT;
-    addr_info.pNext = NULL;
-    addr_info.address = view.va;
-    addr_info.range = view.range;
-    addr_info.format = VK_FORMAT_UNDEFINED;
-    VK_CALL(vkGetDescriptorEXT(device->vk_device, &get_info,
-            device->device_info.descriptor_buffer_properties.robustStorageBufferDescriptorSize,
-            d.payload + device->bindless_state.packed_raw_buffer_offset));
+    vkd3d_write_packed_buffer_ssbo(device, &view, desc->Format != DXGI_FORMAT_UNKNOWN && !is_byte_address,
+            d.payload + device->bindless_state.packed_raw_buffer_offset);
 
     /* UAV counter and texel buffers alias. This is fine. We don't expect having to work around
      * scenarios where this happens.
      * Reuse the texel buffer system here directly.
      * We might as well use it when it's practical. */
 
+    get_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT;
+    get_info.pNext = NULL;
     get_info.type = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
     get_info.data.pStorageTexelBuffer = &addr_info;
+    addr_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT;
+    addr_info.pNext = NULL;
+    addr_info.address = view.va;
+    addr_info.range = view.range;
 
     if (resource && counter_resource)
     {
